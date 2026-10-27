@@ -15,3 +15,5 @@ node_modules/
 dist/
 *.tsbuildinfo
 *.log
+/frontend/vite.config.js
+/frontend/vite.config.d.ts
