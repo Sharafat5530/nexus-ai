@@ -1,66 +1,163 @@
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
-import jwt
+﻿from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any
+
 import bcrypt
+import jwt
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jwt.exceptions import InvalidTokenError
 from sqlalchemy.orm import Session
+
 from app.config import settings
 from app.database import get_db
-from app.models.tenant import User
+from app.models.tenant import Organization, User, UserRole
 
-security_bearer = HTTPBearer()
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    try:
-        return bcrypt.checkpw(
-            plain_password.encode("utf-8"),
-            hashed_password.encode("utf-8")
-        )
-    except Exception:
-        return False
+bearer_scheme = HTTPBearer(auto_error=False)
+
+DatabaseSession = Annotated[Session, Depends(get_db)]
+BearerCredentials = Annotated[
+    HTTPAuthorizationCredentials | None,
+    Depends(bearer_scheme),
+]
+
 
 def get_password_hash(password: str) -> str:
-    pwd_bytes = password.encode("utf-8")[:72]
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
+    password_bytes = password.encode("utf-8")
 
-def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    if not 12 <= len(password_bytes) <= 72:
+        raise ValueError(
+            "Password must contain between 12 and 72 UTF-8 bytes."
+        )
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security_bearer),
-    db: Session = Depends(get_db)
-) -> User:
-    token = credentials.credentials.strip()
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
+    return bcrypt.hashpw(
+        password_bytes,
+        bcrypt.gensalt(rounds=12),
+    ).decode("utf-8")
 
-    # Development auth key (no copy-paste or expiration issues)
-    if settings.DEBUG and token in ("dev_admin", "admin", "dev_token"):
-        admin_user = db.query(User).filter(User.id == "usr_alex_dunhill_01", User.is_active == True).first()
-        if admin_user:
-            return admin_user
 
-    credentials_exception = HTTPException(
+def verify_password(
+    plain_password: str,
+    hashed_password: str,
+) -> bool:
+    password_bytes = plain_password.encode("utf-8")
+
+    if len(password_bytes) > 72:
+        return False
+
+    try:
+        return bcrypt.checkpw(
+            password_bytes,
+            hashed_password.encode("utf-8"),
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def create_access_token(
+    data: dict[str, Any],
+    expires_delta: timedelta | None = None,
+) -> str:
+    now = datetime.now(timezone.utc)
+    lifetime = (
+        expires_delta
+        if expires_delta is not None
+        else timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+
+    claims = {
+        **data,
+        "iat": now,
+        "exp": now + lifetime,
+    }
+
+    return jwt.encode(
+        claims,
+        settings.JWT_SECRET_KEY.get_secret_value(),
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+def authentication_error() -> HTTPException:
+    return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials or token expired",
+        detail="Your session is invalid or has expired. Sign in again.",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    try:
-        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-        user_id: str = payload.get("sub")
-        org_id: str = payload.get("org_id")
-        if not user_id or not org_id:
-            raise credentials_exception
-    except Exception as e:
-        print(f"[AUTH DEBUG] JWT decode error: {e}")
-        raise credentials_exception
 
-    user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
-    if user is None or user.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-tenant access or inactive user")
+
+def get_current_user(
+    credentials: BearerCredentials,
+    db: DatabaseSession,
+) -> User:
+    if credentials is None:
+        raise authentication_error()
+
+    try:
+        claims = jwt.decode(
+            credentials.credentials,
+            settings.JWT_SECRET_KEY.get_secret_value(),
+            algorithms=[settings.JWT_ALGORITHM],
+            options={
+                "require": ["exp", "iat", "sub", "org_id"],
+            },
+        )
+    except InvalidTokenError as error:
+        raise authentication_error() from error
+
+    user_id = claims.get("sub")
+    organization_id = claims.get("org_id")
+
+    if (
+        not isinstance(user_id, str)
+        or not isinstance(organization_id, str)
+    ):
+        raise authentication_error()
+
+    user = (
+        db.query(User)
+        .join(
+            Organization,
+            Organization.id == User.organization_id,
+        )
+        .filter(
+            User.id == user_id,
+            User.organization_id == organization_id,
+            User.is_active.is_(True),
+            Organization.is_active.is_(True),
+        )
+        .first()
+    )
+
+    if user is None:
+        raise authentication_error()
+
+    return user
+
+
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def require_operator(user: CurrentUser) -> User:
+    permitted_roles = {
+        UserRole.ADMIN,
+        UserRole.AGENT_OPERATOR,
+    }
+
+    if user.role not in permitted_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="An operator account is required.",
+        )
+
+    return user
+
+
+def require_admin(user: CurrentUser) -> User:
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="An administrator account is required.",
+        )
+
     return user

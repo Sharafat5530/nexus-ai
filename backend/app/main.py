@@ -39,7 +39,9 @@ async def lifespan(app: FastAPI):
                 id="usr_alex_dunhill_01",
                 organization_id="org_acme_global_01",
                 email="admin@nexus.ai",
-                hashed_password=get_password_hash("NexusAdmin2026!"),
+                hashed_password=get_password_hash(
+    settings.ADMIN_PASSWORD.get_secret_value()
+),
                 full_name="Alex Dunhill",
                 role=UserRole.ADMIN,
                 is_active=True

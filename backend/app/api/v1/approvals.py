@@ -7,14 +7,14 @@ from app.models.tenant import User
 from app.models.workflow import Approval, ApprovalStatus, ActionProposal, ProposalStatus, Task, TaskStatus
 from app.models.audit import AuditEvent, AuditEventType
 from app.schemas.workflow import ApprovalRead, ApprovalDecision
-from app.core.security import get_current_user
+from app.core.security import require_operator
 
 router = APIRouter(prefix="/approvals", tags=["Human Approval Queue"])
 
 @router.get("", response_model=List[ApprovalRead])
 def list_pending_approvals(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_operator)
 ):
     """Retrieves pending approval gates requiring human sign-off."""
     return db.query(Approval).filter(
@@ -27,7 +27,7 @@ def approve_action(
     approval_id: str,
     decision: ApprovalDecision,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_operator)
 ):
     """Signs off on a restricted action proposal. Transition verified by deterministic gateway."""
     approval = db.query(Approval).filter(
@@ -75,7 +75,7 @@ def reject_action(
     approval_id: str,
     decision: ApprovalDecision,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_operator)
 ):
     """Rejects a proposed action. Halts side-effects and informs agent workflow."""
     approval = db.query(Approval).filter(

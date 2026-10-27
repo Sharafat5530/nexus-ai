@@ -1,143 +1,213 @@
-import re
-from typing import Dict, Any, Tuple
 from datetime import datetime
+from decimal import Decimal
+from typing import Any
+
 from sqlalchemy.orm import Session
-from app.models.workflow import ActionProposal, ProposalStatus, Approval, ApprovalStatus, Task, TaskStatus
+
+from app.integrations.orders import order_adapter, parse_money
 from app.models.audit import AuditEvent, AuditEventType
-from app.integrations.orders import order_adapter
+from app.models.business_entities import Order
+from app.models.execution_control import ExecutionControl
+from app.models.refund import RefundExecution
+from app.models.tenant import User, UserRole
+from app.models.workflow import (
+    ApprovalStatus,
+    ActionProposal,
+    ProposalStatus,
+    TaskStatus,
+)
+
 
 class DeterministicActionGateway:
-    """
-    Server-side deterministic security gate.
-    Every state mutation must pass this gateway before hitting business adapters.
-    """
-    
-    # Global Platform Kill Switch
-    KILL_SWITCH_ENGAGED: bool = False
-    
-    # Allowed action allowlist
-    ALLOWED_ACTIONS = {
-        "stripe_partial_refund",
-        "carrier_upgrade",
-        "crm_update_lead",
-        "calendar_book_meeting"
-    }
-    
-    # Hard parameter constraints
-    MAX_REFUND_LIMIT = 50.00
-    
-    # Prompt injection signatures
-    INJECTION_PATTERNS = [
-        r"ignore previous instructions",
-        r"system override",
-        r"admin bypass",
-        r"grant full refund",
-        r"drop table",
-        r"<script>",
-        r"bash -i"
-    ]
+    ALLOWED_ACTIONS = {"stripe_partial_refund"}
+    MAX_REFUND_LIMIT = Decimal("50.00")
 
-    @classmethod
-    def set_kill_switch(cls, enabled: bool) -> bool:
-        cls.KILL_SWITCH_ENGAGED = enabled
-        return cls.KILL_SWITCH_ENGAGED
+    @staticmethod
+    def reject(
+        db: Session,
+        organization_id: str,
+        proposal_id: str,
+        actor_id: str,
+        message: str,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        db.add(
+            AuditEvent(
+                organization_id=organization_id,
+                event_type=AuditEventType.ACTION_BLOCKED,
+                actor_id=actor_id,
+                target_id=proposal_id,
+                summary=message[:255],
+                details={"source": "action_gateway"},
+            )
+        )
+        return False, message, {}
 
     def evaluate_and_execute(
         self,
         db: Session,
         organization_id: str,
         proposal_id: str,
-        actor_id: str
-    ) -> Tuple[bool, str, Dict[str, Any]]:
-        """
-        Revalidates security rules, human sign-offs, and executes the permitted side effect.
-        """
-        # 1. Kill Switch Check
-        if self.KILL_SWITCH_ENGAGED:
-            self._log_violation(db, organization_id, proposal_id, actor_id, "Platform Kill Switch is Active. All side effects frozen.")
-            return False, "Execution blocked: Global Kill Switch is engaged.", {}
+        actor_id: str,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        proposal = (
+            db.query(ActionProposal)
+            .filter(
+                ActionProposal.id == proposal_id,
+                ActionProposal.organization_id == organization_id,
+            )
+            .with_for_update()
+            .first()
+        )
 
-        # 2. Fetch and verify proposal exists in tenant
-        proposal = db.query(ActionProposal).filter(
-            ActionProposal.id == proposal_id,
-            ActionProposal.organization_id == organization_id
-        ).first()
-        if not proposal:
-            return False, "Action Proposal not found or unauthorized tenant.", {}
+        if proposal is None:
+            return False, "Proposal not found.", {}
 
-        # 3. Action Allowlist Check
-        if proposal.action_type not in self.ALLOWED_ACTIONS:
-            self._log_violation(db, organization_id, proposal.id, actor_id, f"Unauthorized tool action: '{proposal.action_type}'")
-            proposal.status = ProposalStatus.BLOCKED
-            db.commit()
-            return False, f"Gateway Policy Violation: Tool '{proposal.action_type}' is not allowlisted.", {}
-
-        # 4. Prompt Injection & Malicious Content Scan
-        payload_str = str(proposal.payload).lower()
-        for pattern in self.INJECTION_PATTERNS:
-            if re.search(pattern, payload_str):
-                self._log_violation(db, organization_id, proposal.id, actor_id, f"Prompt injection signature detected: '{pattern}'")
-                proposal.status = ProposalStatus.BLOCKED
-                db.commit()
-                return False, "Gateway Security Alert: Prompt injection pattern detected in payload.", {}
-
-        # 5. Hard Parameter Validation (Refund Ceiling)
-        if proposal.action_type == "stripe_partial_refund":
-            amount = float(proposal.payload.get("amount", 0.0))
-            if amount <= 0:
-                return False, "Invalid refund amount: Must be greater than $0.00.", {}
-            if amount > self.MAX_REFUND_LIMIT:
-                self._log_violation(db, organization_id, proposal.id, actor_id, f"Proposed amount ${amount} exceeds ceiling ${self.MAX_REFUND_LIMIT}")
-                proposal.status = ProposalStatus.BLOCKED
-                db.commit()
-                return False, f"Policy Violation: Refund amount ${amount:.2f} exceeds hard limit of ${self.MAX_REFUND_LIMIT:.2f}.", {}
-
-        # 6. Human Approval Revalidation & Expiration Check
-        if proposal.requires_human_approval:
-            approval = proposal.approval
-            if not approval:
-                return False, "Restricted action requires an approval gate record.", {}
-            if approval.status != ApprovalStatus.APPROVED:
-                return False, f"Action cannot execute: Approval status is '{approval.status.value}'.", {}
-            if approval.expires_at and datetime.utcnow() > approval.expires_at:
-                approval.status = ApprovalStatus.EXPIRED
-                proposal.status = ProposalStatus.BLOCKED
-                db.commit()
-                return False, "Approval has expired. Action must be re-evaluated.", {}
-
-        # 7. Execute Permitted Mutation via Typed Business Adapter
-        execution_result = {}
-        if proposal.action_type == "stripe_partial_refund":
-            order_num = proposal.target_entity.replace("order:", "")
-            execution_result = order_adapter.process_refund(
-                db=db,
-                organization_id=organization_id,
-                order_number=order_num,
-                amount=float(proposal.payload.get("amount")),
-                reason=proposal.payload.get("reason", "Goodwill credit"),
-                idempotency_key=proposal.idempotency_key,
-                actor_id=actor_id
+        def deny(message: str):
+            return self.reject(
+                db,
+                organization_id,
+                proposal_id,
+                actor_id,
+                message,
             )
 
-        # 8. Advance State to Pending Independent Verification
-        proposal.status = ProposalStatus.EXECUTED
         task = proposal.task
-        if task:
-            task.status = TaskStatus.EXECUTING
-        db.commit()
 
-        return True, "Action successfully verified and executed by Gateway.", execution_result
+        if task is None or task.organization_id != organization_id:
+            return deny("Proposal has no valid task in this organization.")
 
-    def _log_violation(self, db: Session, org_id: str, target_id: str, actor_id: str, summary: str):
-        audit = AuditEvent(
-            organization_id=org_id,
-            event_type=AuditEventType.ACTION_BLOCKED,
-            actor_id=actor_id,
-            target_id=target_id,
-            summary=f"ZERO-TRUST GATEWAY INTERVENTION: {summary}",
-            details={"timestamp": datetime.utcnow().isoformat()}
+        if proposal.action_type not in self.ALLOWED_ACTIONS:
+            return deny("This action is not supported by the gateway.")
+
+        if not proposal.target_entity.startswith("order:"):
+            return deny("A refund must target an order.")
+
+        order_number = proposal.target_entity.removeprefix("order:")
+
+        if not order_number:
+            return deny("The order reference is missing.")
+
+        payload = proposal.payload
+
+        if not isinstance(payload, dict):
+            return deny("The proposal payload is invalid.")
+
+        amount = parse_money(payload.get("amount"))
+        reason = payload.get("reason")
+
+        if not isinstance(reason, str) or not reason.strip():
+            return deny("A refund reason is required.")
+
+        if len(reason) > 255:
+            return deny("The refund reason exceeds 255 characters.")
+
+        if amount > self.MAX_REFUND_LIMIT:
+            return deny("Refund exceeds the gateway limit of 50.00.")
+
+        order = (
+            db.query(Order)
+            .filter(
+                Order.organization_id == organization_id,
+                Order.order_number == order_number,
+            )
+            .first()
         )
-        db.add(audit)
-        db.commit()
+
+        if order is None:
+            return deny("Order not found in this organization.")
+
+        if payload.get("currency") != order.currency:
+            return deny("Refund currency must match the order currency.")
+
+        if task.customer_id != order.customer_id:
+            return deny("The order does not belong to the task customer.")
+
+        if proposal.status == ProposalStatus.EXECUTED:
+            receipt = (
+                db.query(RefundExecution)
+                .filter(
+                    RefundExecution.organization_id == organization_id,
+                    RefundExecution.idempotency_key == proposal.idempotency_key,
+                )
+                .first()
+            )
+
+            if receipt is None:
+                return deny("Executed proposal has no refund receipt.")
+
+            if (
+                receipt.order_id != order.id
+                or receipt.amount != amount
+                or receipt.currency != order.currency
+                or receipt.reason != reason
+            ):
+                return deny("Execution receipt does not match the proposal.")
+
+            return (
+                True,
+                "This action was already executed.",
+                order_adapter.build_receipt(
+                    receipt,
+                    order_number,
+                    repeated=True,
+                ),
+            )
+
+        control = db.get(ExecutionControl, "global")
+
+        if control is not None and control.paused:
+            return deny("Execution is paused by an administrator.")
+
+        if proposal.status != ProposalStatus.APPROVED:
+            return deny("The proposal must be approved before execution.")
+
+        approval = proposal.approval
+
+        if (
+            approval is None
+            or approval.organization_id != organization_id
+            or approval.status != ApprovalStatus.APPROVED
+        ):
+            return deny("A valid human approval is required.")
+
+        if (
+            approval.expires_at is None
+            or approval.expires_at <= datetime.utcnow()
+        ):
+            return deny("Approval has expired or has no expiry time.")
+
+        reviewer = (
+            db.query(User)
+            .filter(
+                User.id == approval.reviewer_id,
+                User.organization_id == organization_id,
+                User.is_active.is_(True),
+                User.role.in_(
+                    [UserRole.ADMIN, UserRole.AGENT_OPERATOR]
+                ),
+            )
+            .first()
+        )
+
+        if reviewer is None:
+            return deny("Approval reviewer is not an active authorized operator.")
+
+        receipt = order_adapter.process_refund(
+            db=db,
+            organization_id=organization_id,
+            order_number=order_number,
+            amount=amount,
+            reason=reason,
+            idempotency_key=proposal.idempotency_key,
+            actor_id=actor_id,
+        )
+
+        proposal.status = ProposalStatus.EXECUTED
+        task.status = TaskStatus.VERIFYING
+
+        db.flush()
+
+        return True, "Refund recorded. Outcome verification is pending.", receipt
+
 
 action_gateway = DeterministicActionGateway()

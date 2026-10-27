@@ -1,3 +1,5 @@
+import { NavLink } from "react-router-dom";
+import { AuthGate } from "@/components/auth/AuthGate";
 import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AppShell } from '@/components/layout/AppShell';
@@ -6,7 +8,7 @@ import { PlaceholderPage } from '@/pages/PlaceholderPage';
 
 export const App: React.FC = () => {
   return (
-    <BrowserRouter>
+    <AuthGate><BrowserRouter>
       <Routes>
         <Route path="/" element={<AppShell />}>
           <Route index element={<OverviewPage />} />
@@ -145,7 +147,7 @@ export const App: React.FC = () => {
 
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
-    </BrowserRouter>
+    </BrowserRouter></AuthGate>
   );
 };
 
